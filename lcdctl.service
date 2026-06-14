@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/lcdctl stats --interval 5
+ExecStart=/usr/bin/python3 /usr/local/bin/lcdctl main
 Restart=always
 RestartSec=5
 StandardOutput=journal
