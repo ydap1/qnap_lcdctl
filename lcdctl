@@ -295,14 +295,6 @@ class LcdController:
             self.write(row, padded[i : i + width])
             time.sleep(delay)
 
-    def read_buttons(self, timeout=None):
-        """
-        Read button state. Returns one of: 'Up', 'Down', 'Both', 'unknown', None.
-        NOTE: this blocks on serial read (8 bytes).
-        """
-        return self.lcd.Read()
-
-
 # =============================================================================
 # Command implementations
 # =============================================================================
@@ -346,19 +338,6 @@ def cmd_off(lcd, args):
 def cmd_on(lcd, args):
     lcd.enable()
     print("LCD enabled.")
-
-
-def cmd_read(lcd, args):
-    lcd.enable()
-    print("Press a button on the front panel (Ctrl+C to stop)...")
-    try:
-        while True:
-            state = lcd.read_buttons()
-            if state:
-                print(f"  Button: {state}")
-                lcd.write(1, f"Btn: {state[:11]}")
-    except KeyboardInterrupt:
-        print("\nStopped.")
 
 
 def cmd_demo(lcd, args):
@@ -503,11 +482,9 @@ Examples:
     # demo
     sub.add_parser("demo", help="Run a demo of all features")
 
-    # clear / on / off / read
     sub.add_parser("clear", help="Blank the LCD")
     sub.add_parser("on", help="Enable the LCD backlight")
     sub.add_parser("off", help="Disable the LCD backlight")
-    sub.add_parser("read", help="Read front-panel button presses")
 
     # main
     p_main = sub.add_parser("main", help="Show hostname + disk/memory")
@@ -534,7 +511,6 @@ def main():
         "clear": cmd_clear,
         "on": cmd_on,
         "off": cmd_off,
-        "read": cmd_read,
         "demo": cmd_demo,
         "stats": cmd_stats,
         "main": cmd_main,

@@ -29,7 +29,6 @@ sudo ./lcdctl main
 | `clear` | Blank the LCD |
 | `on` | Enable LCD backlight |
 | `off` | Disable LCD backlight |
-| `read` | Read front-panel button presses |
 
 ## Systemd Service
 
