@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""
+lcdctl - Control the front-panel LCD on QNAP TS-853A (and similar models)
+
+Self-contained script. The only external dependency is pyserial:
+  pip3 install -r requirements.txt        # or: apt install python3-serial
+
+The LCD is 2 rows x 16 characters, connected on /dev/ttyS1 @ 1200 baud.
+"""
+
+import sys
+import os
+import time
+import argparse
+import socket
+import struct
+import fcntl
+
+# ---------------------------------------------------------------------------
+# External dependency: pyserial
+# ---------------------------------------------------------------------------
+try:
+    import serial
+except ImportError:
+    print("Error: pyserial is required.")
+    print("Install with:  sudo apt install python3-serial")
+    print("         or:  pip3 install pyserial")
+    sys.exit(1)
+
+
+# =============================================================================
+# Inlined QnapDisplay driver (originally from bkram/qnapdisplay)
+# =============================================================================
+class QnapDisplay:
+    """
+    Low-level driver for the QNAP front-panel LCD.
+    Talks to /dev/ttyS1 at 1200 baud.
+    """
+
+    # 8-bit keycodes returned by the front-panel buttons
+    down = [
+        b'S\x05\x00\x02S\x05\x00\x00',
+        b'S\x05\x00\x00S\x05\x00\x02',
+        b'S\x05\x00\x02S\x05\x00\x00',
+    ]
+    up = [
+        b'S\x05\x00\x01S\x05\x00\x00',
+        b'S\x05\x00\x00S\x05\x00\x01',
+        b'S\x05\x00\x01S\x05\x00\x00',
+    ]
+    both = [
+        b'S\x05\x00\x01S\x05\x00\x03',
+        b'S\x05\x00\x02S\x05\x00\x03',
+        b'S\x05\x00\x03S\x05\x00\x00',
+    ]
+
+    def __init__(self):
+        # Open serial port on instantiation so we don't crash at import time
+        # on systems that lack /dev/ttyS1.
+        self.ser = serial.Serial("/dev/ttyS1", 1200)
+
+    def Init(self):
+        self.ser.write(b'M\x00')
+        initlcd = self.ser.read(4)
+        return initlcd == b'S\x01\x00}'
+
+    def Write(self, row, text):
+        if row == 0:
+            initrow = b'M\x0c\x00\x10'
+        elif row == 1:
+            initrow = b'M\x0c\x01\x10'
+        else:
+            return
+        text = str(text).ljust(16)[:16]
+        # The LCD controller only understands a limited character set.
+        # UTF-8 multi-byte sequences (e.g. for Unicode block chars) show up
+        # as random symbols (often Greek beta). Force plain ASCII.
+        ascii_text = text.encode("ascii", "replace").decode("ascii")
+        ascii_text = ascii_text.replace("?", " ")  # drop replacement chars
+        self.ser.write(b'M^\x01')
+        self.ser.write(initrow + ascii_text.encode("ascii"))
+
+    def Read(self):
+        key = self.ser.read(8)
+        if key in self.down:
+            state = "Down"
+        elif key in self.up:
+            state = "Up"
+        elif key in self.both:
+            state = "Both"
+            # Ignore next event as it is always bogus after both keys are pressed.
+            self.ser.read(8)
+        else:
+            state = "unknown"
+        return state
+
+    def Enable(self):
+        self.ser.write(b'M^\x01\n')
+
+    def Disable(self):
+        self.ser.write(b'M^\x00\n')
+
+
+# =============================================================================
+# High-level controller
+# =============================================================================
+LCD_ROWS = 2
+LCD_COLS = 16
+SERIAL_DEV = "/dev/ttyS1"
+
+
+def clamp(val, minval, maxval):
+    return max(minval, min(maxval, val))
+
+
+def pad_or_truncate(text, width=LCD_COLS):
+    """Force *text* to exactly *width* characters."""
+    text = str(text)
+    if len(text) > width:
+        return text[:width]
+    return text.ljust(width)
+
+
+def center(text, width=LCD_COLS):
+    text = str(text)
+    if len(text) >= width:
+        return text[:width]
+    pad = width - len(text)
+    left = pad // 2
+    right = pad - left
+    return " " * left + text + " " * right
+
+
+def read_file(path, default=None):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except (OSError, IOError):
+        return default
+
+
+def _iface_addr(ifname):
+    """Return IPv4 address for a specific interface, or None."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(
+            fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", ifname.encode()[:15]))[20:24]
+        )
+    except Exception:
+        return None
+
+
+def get_ip_address():
+    """Return the LAN IPv4 address, skipping loopback and docker/container interfaces."""
+    # Try common physical interface names first
+    for iface in ["eth0", "eth1", "eno1", "eno2", "ens3", "ens4", "enp3s0", "enp4s0"]:
+        addr = _iface_addr(iface)
+        if addr and not addr.startswith("127."):
+            return addr
+
+    # Scan /sys/class/net and skip docker/virtual interfaces
+    skip_prefixes = ("lo", "docker", "br-", "veth", "virbr", "wg", "tun", "tap", "dummy")
+    try:
+        for if_addr in sorted(os.listdir("/sys/class/net/")):
+            if if_addr.startswith(skip_prefixes):
+                continue
+            addr = _iface_addr(if_addr)
+            if addr and not addr.startswith("127.") and not addr.startswith("172."):
+                return addr
+            # If we only got 172.x, keep it as fallback
+            if addr and not addr.startswith("127."):
+                fallback = addr
+    except Exception:
+        fallback = None
+
+    if fallback:
+        return fallback
+
+    # Last resort
+    try:
+        return socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)[0][4][0]
+    except Exception:
+        return "0.0.0.0"
+
+
+def get_uptime():
+    raw = read_file("/proc/uptime", "0 0")
+    try:
+        seconds = int(float(raw.split()[0]))
+    except (ValueError, IndexError):
+        seconds = 0
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours:02d}:{minutes:02d}"
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def get_loadavg():
+    raw = read_file("/proc/loadavg", "0.0 0.0 0.0")
+    try:
+        return raw.split()[0]
+    except (ValueError, IndexError):
+        return "0.0"
+
+
+def get_cpu_temp():
+    """Return first available CPU temperature in °C, or None."""
+    for base in ["/sys/class/hwmon/hwmon0", "/sys/class/hwmon/hwmon1"]:
+        for fname in ["temp1_input", "temp2_input"]:
+            path = os.path.join(base, fname)
+            if os.path.exists(path):
+                try:
+                    return int(read_file(path, "0")) / 1000.0
+                except (ValueError, TypeError):
+                    continue
+    return None
+
+
+def get_mem_info():
+    total = used = "?"
+    total_kb = avail_kb = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_kb = int(line.split()[1])
+                    total = f"{total_kb // 1024}M"
+                elif line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+        if total_kb:
+            used_kb = total_kb - avail_kb
+            used = f"{used_kb // 1024}M"
+    except Exception:
+        pass
+    return used, total
+
+
+def get_disk_usage(path="/"):
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bfree * st.f_frsize
+        used = total - free
+        pct = int(used * 100 / total) if total else 0
+        total_gb = total // (1024 ** 3)
+        used_gb = used // (1024 ** 3)
+        return f"{used_gb}G/{total_gb}G", pct
+    except Exception:
+        return "?", 0
+
+
+# ---------------------------------------------------------------------------
+# LCD wrapper with convenience methods
+# ---------------------------------------------------------------------------
+class LcdController:
+    def __init__(self):
+        if not os.access(SERIAL_DEV, os.R_OK | os.W_OK):
+            print(f"Error: cannot access {SERIAL_DEV}. Try: sudo chmod 666 {SERIAL_DEV}")
+            sys.exit(1)
+        self.lcd = QnapDisplay()
+        self._enabled = True
+
+    def enable(self):
+        self.lcd.Enable()
+        self._enabled = True
+
+    def disable(self):
+        self.lcd.Disable()
+        self._enabled = False
+
+    def clear(self):
+        self.write(0, "")
+        self.write(1, "")
+
+    def write(self, row, text):
+        if not 0 <= row < LCD_ROWS:
+            raise ValueError("row must be 0 or 1")
+        self.lcd.Write(row, pad_or_truncate(text))
+
+    def write_both(self, line0, line1):
+        self.write(0, line0)
+        self.write(1, line1)
+
+    def marquee(self, row, text, width=LCD_COLS, delay=0.25):
+        """Scroll *text* horizontally across *row*. Blocks until complete."""
+        text = str(text)
+        if len(text) <= width:
+            self.write(row, center(text, width))
+            time.sleep(delay * 2)
+            return
+        padded = " " * width + text + " " * width
+        for i in range(len(padded) - width + 1):
+            self.write(row, padded[i : i + width])
+            time.sleep(delay)
+
+    def read_buttons(self, timeout=None):
+        """
+        Read button state. Returns one of: 'Up', 'Down', 'Both', 'unknown', None.
+        NOTE: this blocks on serial read (8 bytes).
+        """
+        return self.lcd.Read()
+
+
+# =============================================================================
+# Command implementations
+# =============================================================================
+
+
+def cmd_static(lcd, args):
+    """Write static text to one or both rows."""
+    lcd.enable()
+    line0 = args.line0 if args.line0 is not None else ""
+    line1 = args.line1 if args.line1 is not None else ""
+    lcd.write_both(line0, line1)
+    print(f"LCD row 0: '{pad_or_truncate(line0)}'")
+    print(f"LCD row 1: '{pad_or_truncate(line1)}'")
+
+
+def cmd_scroll(lcd, args):
+    """Scroll text across a row."""
+    lcd.enable()
+    text = args.text
+    row = args.row
+    delay = args.delay
+    repeats = args.repeat
+    for _ in range(repeats):
+        lcd.marquee(row, text, delay=delay)
+    if len(text) <= LCD_COLS:
+        lcd.write(row, center(text))
+
+
+def cmd_clear(lcd, args):
+    lcd.enable()
+    lcd.clear()
+    print("LCD cleared.")
+
+
+def cmd_off(lcd, args):
+    lcd.clear()
+    lcd.disable()
+    print("LCD disabled.")
+
+
+def cmd_on(lcd, args):
+    lcd.enable()
+    print("LCD enabled.")
+
+
+def cmd_read(lcd, args):
+    lcd.enable()
+    print("Press a button on the front panel (Ctrl+C to stop)...")
+    try:
+        while True:
+            state = lcd.read_buttons()
+            if state:
+                print(f"  Button: {state}")
+                lcd.write(1, f"Btn: {state[:11]}")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+def cmd_demo(lcd, args):
+    """Show off all capabilities."""
+    lcd.enable()
+
+    lcd.write_both("  ------------  ", "  ____________  ")
+    time.sleep(0.5)
+    lcd.write_both(" || QNAP TS || ", " || 853A NAS || ")
+    time.sleep(1.5)
+
+    hostname = socket.gethostname()[:16]
+    ip = get_ip_address()
+    lcd.write_both(f"Host: {hostname[:10]}", f"IP: {ip[:14]}")
+    time.sleep(2)
+
+    lcd.write(0, "  Message:       ")
+    lcd.marquee(1, "Welcome to OpenMediaVault on TS-853A! ", delay=0.2)
+    time.sleep(0.5)
+
+    cpu_temp = get_cpu_temp()
+    if cpu_temp is not None:
+        lcd.write_both("  CPU Temp", f"    {cpu_temp:.1f}C")
+        time.sleep(1.5)
+
+    used, total = get_mem_info()
+    lcd.write_both("  Memory Used", f"   {used}/{total}")
+    time.sleep(1.5)
+
+    lcd.write_both(f"Up: {get_uptime()}", f"Load: {get_loadavg()}")
+    time.sleep(2)
+
+    lcd.write_both("   Demo done!   ", "                ")
+    time.sleep(1)
+    lcd.clear()
+    print("Demo finished.")
+
+
+def cmd_stats(lcd, args):
+    """Continuously display system stats, cycling every *interval* seconds."""
+    lcd.enable()
+    interval = args.interval
+
+    def page_hostname_ip():
+        return (socket.gethostname()[:16], get_ip_address()[:16])
+
+    def page_uptime_load():
+        return (f"Up: {get_uptime()}", f"Load: {get_loadavg()}")
+
+    def page_mem():
+        used, total = get_mem_info()
+        return ("  Memory", f" {used} / {total}")
+
+    def page_disk():
+        info, pct = get_disk_usage(args.disk)
+        bar_len = 10
+        filled = int(pct / 100.0 * bar_len)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        return (f"Disk {args.disk}", f"{bar} {pct}%")
+
+    def page_temp():
+        t = get_cpu_temp()
+        if t is None:
+            return (" Temperature ", "  N/A  ")
+        bar_len = 10
+        temp_pct = clamp((t - 30) / 60.0, 0, 1)
+        filled = int(temp_pct * bar_len)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        return ("  CPU Temp", f"{bar} {t:.0f}C")
+
+    pages = [page_hostname_ip, page_uptime_load, page_mem, page_disk, page_temp]
+    page_idx = 0
+
+    print(f"Starting stats display. Interval={interval}s. Ctrl+C to stop.")
+    try:
+        while True:
+            l0, l1 = pages[page_idx]()
+            lcd.write_both(l0, l1)
+            time.sleep(interval)
+            page_idx = (page_idx + 1) % len(pages)
+    except KeyboardInterrupt:
+        print("\nStats display stopped.")
+        if args.clear_on_exit:
+            lcd.clear()
+
+
+def cmd_peroni(lcd, args):
+    """Show 'PERONI <3' with disk + memory underneath."""
+    lcd.enable()
+    disk_info, disk_pct = get_disk_usage(args.disk)
+    mem_used, mem_total = get_mem_info()
+    # Row 0: PERONI <3 centered
+    lcd.write(0, "PERONI <3")
+    # Row 1: disk% and mem usage
+    # Format: D:45% M:2G/8G
+    line1 = f"D:{disk_pct}% M:{mem_used}/{mem_total}"
+    lcd.write(1, line1)
+    print(f"PERONI <3")
+    print(f"Disk: {disk_info} ({disk_pct}%), Mem: {mem_used}/{mem_total}")
+
+
+# =============================================================================
+# Argument parser
+# =============================================================================
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Control the QNAP TS-853A front-panel LCD",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s static "Hello" "World"
+  %(prog)s static --line0 "CPU: 45C" --line1 "MEM: 2G/8G"
+  %(prog)s scroll "This is a long message that will scroll..."
+  %(prog)s stats
+  %(prog)s demo
+  %(prog)s clear
+  %(prog)s off
+  %(prog)s peroni
+  %(prog)s peroni --disk /srv/data
+        """,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # static
+    p_static = sub.add_parser("static", help="Write static text to the LCD")
+    p_static.add_argument("line0", nargs="?", default="", help="Text for row 0 (16 chars)")
+    p_static.add_argument("line1", nargs="?", default="", help="Text for row 1 (16 chars)")
+    p_static.add_argument("--line0", dest="_line0_opt", help="Override row 0 text")
+    p_static.add_argument("--line1", dest="_line1_opt", help="Override row 1 text")
+
+    # scroll
+    p_scroll = sub.add_parser("scroll", help="Scroll long text across a row")
+    p_scroll.add_argument("text", help="Text to scroll")
+    p_scroll.add_argument("-r", "--row", type=int, choices=[0, 1], default=0, help="Row to scroll on (default: 0)")
+    p_scroll.add_argument("-d", "--delay", type=float, default=0.25, help="Scroll speed in seconds (default: 0.25)")
+    p_scroll.add_argument("-n", "--repeat", type=int, default=1, help="Number of repeats (default: 1)")
+
+    # stats
+    p_stats = sub.add_parser("stats", help="Continuously show system stats")
+    p_stats.add_argument("-i", "--interval", type=float, default=3.0, help="Seconds between pages (default: 3)")
+    p_stats.add_argument("--disk", default="/", help="Filesystem path for disk usage (default: /)")
+    p_stats.add_argument("--clear-on-exit", action="store_true", help="Blank LCD on exit")
+
+    # demo
+    sub.add_parser("demo", help="Run a demo of all features")
+
+    # clear / on / off / read
+    sub.add_parser("clear", help="Blank the LCD")
+    sub.add_parser("on", help="Enable the LCD backlight")
+    sub.add_parser("off", help="Disable the LCD backlight")
+    sub.add_parser("read", help="Read front-panel button presses")
+
+    # peroni
+    p_peroni = sub.add_parser("peroni", help="Show PERONI <3 + disk/memory")
+    p_peroni.add_argument("--disk", default="/", help="Filesystem path for disk usage (default: /)")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "static":
+        if getattr(args, "_line0_opt", None):
+            args.line0 = args._line0_opt
+        if getattr(args, "_line1_opt", None):
+            args.line1 = args._line1_opt
+
+    lcd = LcdController()
+
+    commands = {
+        "static": cmd_static,
+        "scroll": cmd_scroll,
+        "clear": cmd_clear,
+        "on": cmd_on,
+        "off": cmd_off,
+        "read": cmd_read,
+        "demo": cmd_demo,
+        "stats": cmd_stats,
+        "main": cmd_main,
+    }
+
+    commands[args.command](lcd, args)
+
+
+if __name__ == "__main__":
+    main()
