@@ -445,18 +445,16 @@ def cmd_stats(lcd, args):
             lcd.clear()
 
 
-def cmd_peroni(lcd, args):
-    """Show 'PERONI <3' with disk + memory underneath."""
+def cmd_main(lcd, args):
+    """Show hostname + disk and memory usage."""
     lcd.enable()
     disk_info, disk_pct = get_disk_usage(args.disk)
     mem_used, mem_total = get_mem_info()
-    # Row 0: PERONI <3 centered
-    lcd.write(0, "PERONI <3")
-    # Row 1: disk% and mem usage
-    # Format: D:45% M:2G/8G
+    hostname = socket.gethostname()[:16]
+    lcd.write(0, hostname)
     line1 = f"D:{disk_pct}% M:{mem_used}/{mem_total}"
     lcd.write(1, line1)
-    print(f"PERONI <3")
+    print(f"Hostname: {hostname}")
     print(f"Disk: {disk_info} ({disk_pct}%), Mem: {mem_used}/{mem_total}")
 
 
@@ -476,8 +474,8 @@ Examples:
   %(prog)s demo
   %(prog)s clear
   %(prog)s off
-  %(prog)s peroni
-  %(prog)s peroni --disk /srv/data
+  %(prog)s main
+  %(prog)s main --disk /srv/data
         """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -511,9 +509,9 @@ Examples:
     sub.add_parser("off", help="Disable the LCD backlight")
     sub.add_parser("read", help="Read front-panel button presses")
 
-    # peroni
-    p_peroni = sub.add_parser("peroni", help="Show PERONI <3 + disk/memory")
-    p_peroni.add_argument("--disk", default="/", help="Filesystem path for disk usage (default: /)")
+    # main
+    p_main = sub.add_parser("main", help="Show hostname + disk/memory")
+    p_main.add_argument("--disk", default="/", help="Filesystem path for disk usage (default: /)")
 
     return parser
 
